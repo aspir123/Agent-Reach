@@ -1,162 +1,132 @@
 # -*- coding: utf-8 -*-
-"""XiaoHongShu — check if xhs-cli (xiaohongshu-cli) is available."""
+"""XiaoHongShu through upstream OpenCLI in the Reach-owned browser."""
 
-import shutil
-import subprocess
-from .base import Channel
+from agent_reach.backends.opencli import opencli_call, opencli_items
+from agent_reach.runtime.result import BAD_INPUT, NOT_FOUND, UPSTREAM_BROKEN, ReachError
 
+from .base import Action, Channel, Param
 
-def format_xhs_result(data):
-    """Clean XHS API response, keeping only useful fields.
-
-    Handles both single note objects and lists of notes (search results).
-    Drastically reduces token usage by stripping structural redundancy (#134).
-    """
-    if isinstance(data, list):
-        return [_clean_note(item) for item in data]
-    if isinstance(data, dict):
-        # Handle search_feeds wrapper: {"items": [...]} or {"data": {"items": [...]}}
-        items = None
-        if "items" in data:
-            items = data["items"]
-        elif "data" in data and isinstance(data.get("data"), dict):
-            items = data["data"].get("items") or data["data"].get("notes")
-        if items and isinstance(items, list):
-            return [_clean_note(item) for item in items]
-        # Single note
-        return _clean_note(data)
-    return data
-
-
-def _clean_note(note):
-    """Extract useful fields from a single XHS note/feed item."""
-    if not isinstance(note, dict):
-        return note
-
-    # Some responses nest the note under "note_card" or "note"
-    inner = note.get("note_card") or note.get("note") or note
-
-    result = {}
-
-    # Basic info
-    for key in ("id", "note_id", "xsec_token", "title", "desc", "type", "time"):
-        if key in inner:
-            result[key] = inner[key]
-
-    # Content (may be in desc or content)
-    if "content" in inner and "desc" not in result:
-        result["content"] = inner["content"]
-
-    # Author
-    user = inner.get("user") or inner.get("author")
-    if isinstance(user, dict):
-        result["user"] = {
-            k: user[k] for k in ("nickname", "user_id", "nick_name") if k in user
-        }
-
-    # Engagement metrics
-    interact = inner.get("interact_info") or inner.get("note_interact_info") or {}
-    if isinstance(interact, dict):
-        for key in ("liked_count", "collected_count", "comment_count", "share_count"):
-            if key in interact:
-                result[key] = interact[key]
-    # Also check top-level (some API formats)
-    for key in ("liked_count", "collected_count", "comment_count", "share_count"):
-        if key in inner and key not in result:
-            result[key] = inner[key]
-
-    # Images — just URLs
-    images = inner.get("image_list") or inner.get("images_list") or []
-    if isinstance(images, list):
-        urls = []
-        for img in images:
-            if isinstance(img, dict):
-                url = img.get("url") or img.get("url_default") or img.get("original")
-                if url:
-                    urls.append(url)
-            elif isinstance(img, str):
-                urls.append(img)
-        if urls:
-            result["images"] = urls
-
-    # Tags
-    tags = inner.get("tag_list") or inner.get("tags") or []
-    if isinstance(tags, list):
-        tag_names = []
-        for t in tags:
-            if isinstance(t, dict) and "name" in t:
-                tag_names.append(t["name"])
-            elif isinstance(t, str):
-                tag_names.append(t)
-        if tag_names:
-            result["tags"] = tag_names
-
-    # Comments (if present, e.g. from get_feed_detail with comments)
-    comments = inner.get("comments") or []
-    if isinstance(comments, list) and comments:
-        result["comments"] = [_clean_comment(c) for c in comments]
-
-    return result
-
-
-def _clean_comment(comment):
-    """Extract useful fields from a comment."""
-    if not isinstance(comment, dict):
-        return comment
-    result = {}
-    if "content" in comment:
-        result["content"] = comment["content"]
-    user = comment.get("user_info") or comment.get("user")
-    if isinstance(user, dict):
-        result["user"] = user.get("nickname") or user.get("nick_name", "")
-    for key in ("like_count", "sub_comment_count"):
-        if key in comment:
-            result[key] = comment[key]
-    return result
+_XHS_LOGIN_HINT = (
+    "Run agent-reach login xiaohongshu to open the Agent Reach dedicated browser. "
+    "Reach first tries the existing local site login; the user completes any remaining login. Never ask for a password."
+)
 
 
 class XiaoHongShuChannel(Channel):
     name = "xiaohongshu"
     description = "小红书笔记"
-    backends = ["xhs-cli (xiaohongshu-cli)"]
-    tier = 1
+
+    level = "optional"
+    login_url = "https://www.xiaohongshu.com/explore"
+    tools = ("opencli",)
+    prereqs = ("node", "chrome")
+
+    def setup_problems(self):
+        from agent_reach.runtime.browser_binding import setup_problems
+
+        return setup_problems(self.name)
+
+    actions = (
+        Action(
+            "search",
+            "Search notes",
+            (
+                Param("query", "what to search for"),
+                Param("limit", "max results", required=False, type=int, default=5),
+            ),
+            (("opencli", "_opencli_search"),),
+            live_test={"query": "咖啡", "limit": 2},
+            public_web=("xiaohongshu.com/explore/", "xiaohongshu.com/search_result/", "xhslink.com/"),
+        ),
+        Action(
+            "read",
+            "Read a note (full link including xsec_token, as returned by search)",
+            (Param("target", "full note link with xsec_token"),),
+            (("opencli", "_opencli_read"),),
+            public_web=("xiaohongshu.com/explore/", "xiaohongshu.com/search_result/", "xhslink.com/"),
+        ),
+        Action(
+            "comments",
+            "Read loaded comments and replies from a note; not an exhaustive export",
+            (Param("target", "full note link with xsec_token"),
+             Param("limit", "max top-level comments (1..50); loaded replies are included",
+                   required=False, type=int, default=20)),
+            (("opencli", "_opencli_comments"),),
+            timeout=60,
+        ),
+    )
 
     def can_handle(self, url: str) -> bool:
-        from urllib.parse import urlparse
-        d = urlparse(url).netloc.lower()
-        return "xiaohongshu.com" in d or "xhslink.com" in d
+        from agent_reach.utils.url import host_matches
 
-    def check(self, config=None):
-        xhs = shutil.which("xhs")
-        if not xhs:
-            return "off", (
-                "需要安装 xhs-cli：\n"
-                "  pipx install xiaohongshu-cli\n"
-                "或：\n"
-                "  uv tool install xiaohongshu-cli\n"
-                "安装后运行 `xhs login` 登录"
+        return host_matches(url, "xiaohongshu.com", "xhslink.com")
+
+    # ── unified entry backends ──
+
+    def _opencli_search(self, *, query: str, limit: int, timeout: float) -> list:
+        rows = opencli_call(
+            "xiaohongshu", ["search", query, "--limit", str(limit)],
+            timeout=timeout, login_hint=_XHS_LOGIN_HINT,
+        )
+        items = opencli_items(rows)[:limit]
+        if not items:
+            raise ReachError(
+                UPSTREAM_BROKEN,
+                "OpenCLI finished but returned no notes",
             )
+        return items
 
+    def _opencli_read(self, *, target: str, timeout: float) -> list:
+        from agent_reach.utils.url import host_matches
+
+        url = str(target).strip()
+        if not host_matches(url, "xiaohongshu.com", "xhslink.com"):
+            raise ReachError(BAD_INPUT, "target must be a full Xiaohongshu note link including xsec_token")
+        rows = opencli_call("xiaohongshu", ["note", url], timeout=timeout, login_hint=_XHS_LOGIN_HINT)
+        # OpenCLI 2.0 wraps the rows as {"ok": true, "data": [...]}; older versions return the list.
+        if isinstance(rows, dict) and isinstance(rows.get("data"), list):
+            rows = rows["data"]
+        if isinstance(rows, list) and rows and all(isinstance(r, dict) and "field" in r and "value" in r for r in rows):
+            note = {r["field"]: r["value"] for r in rows}
+            note["url"] = url
+            rows = [note]
+        items = opencli_items(rows)
+        if not items:
+            raise ReachError(NOT_FOUND, "note not found")
+        return items[:1]
+
+
+    def validate_params(self, action, params):
+        if action == "comments":
+            self._validate_comments(params["target"], params["limit"])
+
+    @staticmethod
+    def _validate_comments(target, limit):
+        from agent_reach.utils.url import host_matches
         try:
-            r = subprocess.run(
-                [xhs, "status"], capture_output=True,
-                encoding="utf-8", errors="replace", timeout=10,
-            )
-            output = (r.stdout or "") + (r.stderr or "")
-            if r.returncode == 0 and "ok: true" in output:
-                return "ok", (
-                    "完整可用（搜索、阅读、评论、发帖、热门、"
-                    "收藏、关注、用户查询）"
-                )
-            if "not_authenticated" in output or "expired" in output:
-                return "warn", (
-                    "xhs-cli 已安装但未登录。运行：\n"
-                    "  xhs login\n"
-                    "（自动从浏览器提取 Cookie，或扫码登录）"
-                )
-            return "warn", (
-                "xhs-cli 已安装但状态异常。运行：\n"
-                "  xhs -v status 查看详细信息"
-            )
-        except Exception:
-            return "warn", "xhs-cli 已安装但连接失败"
+            import re
+            from urllib.parse import urlsplit
+            parsed = urlsplit(str(target).strip())
+            if (not host_matches(str(target).strip(), "xiaohongshu.com") or parsed.scheme != "https"
+                    or parsed.username or parsed.password or parsed.port not in (None, 443)
+                    or not re.fullmatch(r"/(?:explore|search_result)/[A-Za-z0-9_-]+", parsed.path)):
+                raise ValueError("Expected a direct note URL")
+        except (ValueError, TypeError):
+            raise ReachError(BAD_INPUT, "target must be a direct Xiaohongshu note URL") from None
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+            raise ReachError(BAD_INPUT, "limit must be between 1 and 50 top-level comments")
+
+    def _opencli_comments(self, *, target, limit, timeout):
+        self._validate_comments(target, limit)
+        rows = opencli_call(
+            self.name, ["comments", str(target).strip(), "--limit", str(limit),
+                        "--with-replies", "true"],
+            timeout=timeout, login_hint=_XHS_LOGIN_HINT,
+        )
+        items = opencli_items(rows)
+        for item in items:
+            item["url"] = str(target).strip()
+            raw = dict(item.get("raw") or {})
+            raw.update(content_scope="loaded_comments", exhaustive=False)
+            item["raw"] = raw
+        return items

@@ -1,76 +1,96 @@
 # -*- coding: utf-8 -*-
-"""Reddit — search and read via rdt-cli (public-clis/rdt-cli).
+"""Reddit browser actions supplement public web search and reading.
 
-NOTE: Reddit requires authentication since 2024. All API requests
-(including public subreddit reads) return HTTP 403 without a valid
-session cookie. Run `rdt login` after installation to authenticate.
+Public posts and some comments can be available through an agent's existing
+web tools without Reddit login. A blocked anonymous JSON endpoint does not
+establish a site-wide login requirement. These actions use managed browser
+sessions; request authentication only when the selected path requires it.
 """
 
-import json
-import shutil
-import subprocess
+from agent_reach.backends.opencli import opencli_call, opencli_items
+from agent_reach.runtime.result import BAD_INPUT, UPSTREAM_BROKEN, ReachError
 
-from .base import Channel
+from .base import Action, Channel, Param
 
-_CREDENTIAL_FILE = "~/.config/rdt-cli/credential.json"
+_REDDIT_LOGIN_HINT = (
+    "Ask the user to log in to reddit.com in the Agent Reach dedicated browser. Never log in on their behalf."
+)
+
+
+def _reddit(args, timeout: float) -> list:
+    items = opencli_items(opencli_call("reddit", list(args), timeout=timeout, login_hint=_REDDIT_LOGIN_HINT))
+    if not items:
+        raise ReachError(UPSTREAM_BROKEN, "OpenCLI finished but returned no items")
+    return items
 
 
 class RedditChannel(Channel):
     name = "reddit"
     description = "Reddit 帖子和评论"
-    backends = ["rdt-cli"]
-    tier = 0
+
+    level = "optional"
+    login_url = "https://www.reddit.com/login/"
+    tools = ("opencli",)
+    prereqs = ("node", "chrome")
+
+    def setup_problems(self):
+        from agent_reach.runtime.browser_binding import setup_problems
+
+        return setup_problems(self.name)
+
+    actions = (
+        Action(
+            "search",
+            "Search public posts first; --backend opencli uses site search",
+            (
+                Param("query", "what to search for"),
+                Param("limit", "max results", required=False, type=int, default=5),
+            ),
+            (("opencli", "_opencli_search"),),
+            live_test={"query": "python", "limit": 2},
+            public_web=("reddit.com/r/",),
+        ),
+        Action(
+            "read",
+            "Read public page text first; --backend opencli requests the post and top comments",
+            (Param("target", "post link or id"),),
+            (("opencli", "_opencli_read"),),
+            public_web=("reddit.com/r/", "redd.it/"),
+        ),
+        Action(
+            "subreddit",
+            "Latest posts in a subreddit",
+            (
+                Param("name", "subreddit name without r/, e.g. python"),
+                Param("limit", "max posts", required=False, type=int, default=5),
+            ),
+            (("opencli", "_opencli_subreddit"),),
+            live_test={"name": "python", "limit": 2},
+        ),
+    )
 
     def can_handle(self, url: str) -> bool:
-        from urllib.parse import urlparse
+        from agent_reach.utils.url import host_matches
 
-        d = urlparse(url).netloc.lower()
-        return "reddit.com" in d or "redd.it" in d
+        return host_matches(url, "reddit.com", "redd.it")
 
-    def check(self, config=None):
-        rdt = shutil.which("rdt")
-        if not rdt:
-            return "off", (
-                "需要安装 rdt-cli（推荐使用最新版 v0.4.2+）：\n"
-                "  pip install 'rdt-cli>=0.4.2'\n"
-                "或：\n"
-                "  uv tool install rdt-cli\n"
-                "最新源码：https://github.com/public-clis/rdt-cli\n"
-                "安装后运行 `rdt login` 登录（需先在浏览器登录 reddit.com）"
-            )
+    # ── unified entry backends ──
 
-        try:
-            r = subprocess.run(
-                [rdt, "status", "--json"],
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-            )
-            data = json.loads(r.stdout or "{}")
-            authenticated = data.get("data", {}).get("authenticated", False)
-            username = data.get("data", {}).get("username") or ""
+    def _opencli_search(self, *, query: str, limit: int, timeout: float) -> list:
+        return _reddit(["search", query, "--limit", str(limit)], timeout)[:limit]
 
-            if authenticated:
-                suffix = f"（已登录：{username}）" if username else ""
-                return "ok", (f"rdt-cli 可用{suffix}（搜索帖子、阅读全文、查看评论）")
 
-            return "warn", (
-                "rdt-cli 已安装但未登录。Reddit 自 2024 年起要求认证，"
-                "未登录时所有请求均返回 403。\n\n"
-                "方法一（自动）：运行 `rdt login`\n"
-                "  先在浏览器登录 reddit.com，再运行此命令自动提取 Cookie。\n\n"
-                "方法二（手动，适用于 Chrome/Edge 127+ 无法自动提取时）：\n"
-                "  1. Chrome 应用商店安装 Cookie-Editor 扩展：\n"
-                "     https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm\n"
-                "  2. 在浏览器打开 reddit.com（确保已登录）\n"
-                "  3. 点击 Cookie-Editor 图标，找到 `reddit_session`，复制其 Value\n"
-                f"  4. 将以下内容写入 {_CREDENTIAL_FILE}：\n"
-                '     {"cookies": {"reddit_session": "<粘贴 Value>"}, '
-                '"source": "manual", "username": "<你的用户名>", '
-                '"modhash": null, "saved_at": 0, "last_verified_at": null}\n\n'
-                "验证：`rdt status --json` 确认 authenticated: true"
-            )
+    def _opencli_read(self, *, target: str, timeout: float) -> list:
+        t = str(target).strip()
+        if not (self.can_handle(t) or t.isalnum()):
+            raise ReachError(BAD_INPUT, "target must be a reddit.com post link or post id")
+        items = _reddit(["read", t, "--limit", "20"], timeout)
+        post, comments = items[0], items[1:]
+        if comments:
+            lines = [post["text"] or ""] + [f"\n@{c['author'] or ''}: {c['text'] or ''}" for c in comments]
+            post["text"] = "\n".join(lines).strip()
+            post["raw"] = {"post": post["raw"], "comments": [c["raw"] for c in comments]}
+        return [post]
 
-        except (json.JSONDecodeError, FileNotFoundError, subprocess.TimeoutExpired):
-            return "warn", "rdt-cli 已安装但状态检查失败，运行 `rdt status` 查看详情"
+    def _opencli_subreddit(self, *, name: str, limit: int, timeout: float) -> list:
+        return _reddit(["subreddit", name.removeprefix("r/"), "--limit", str(limit)], timeout)[:limit]
